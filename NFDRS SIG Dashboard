@@ -1,0 +1,150 @@
+
+
+import pandas as pd
+import requests
+from io import StringIO
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+import ipywidgets as widgets
+from IPython.display import display, FileLink
+from ipywidgets import Tab
+
+# -- Time Ranges --
+today = datetime.utcnow()
+year = today.year
+ranges = {
+    "start_hist": "2009-01-01T00:30:00Z",
+    "end_hist": f"{year-1}-12-31T23:30:00Z",
+    "start_current": f"{year}-01-01T00:30:00Z",
+    "end_current": today.strftime("%Y-%m-%dT00:30:00Z"),
+    "start_forecast": today.strftime("%Y-%m-%dT00:30:00Z"),
+    "end_forecast": (today + timedelta(days=7)).strftime("%Y-%m-%dT00:30:00Z"),
+    "year_label": str(year)
+}
+
+# -- Component List --
+index_options = {
+    "Burning Index (BI)": "burningIndex",
+    "Energy Release Component (ERC)": "energyReleaseComponent",
+    "Ignition Component (IC)": "ignitionComponent",
+    "Spread Component (SC)": "spreadComponent",
+    "KBDI": "KBDI",
+    "1000hr Dead FM": "thousandHR_TL_FuelMoisture"
+}
+
+# -- Station Metadata (sample loader) --
+station_df = pd.read_excel("NFDRS_National_Settings_for_Fire_Family_Plus_Catalogs.xlsx", sheet_name="Phase1_NFDR_StnInfo")
+station_df = station_df[(station_df['NFDRSFM'] == 'Y') & station_df['station_id'].notna()]
+station_df['station_id'] = station_df['station_id'].astype(int).astype(str)
+station_df['display_name'] = station_df['station_name'] + " (" + station_df['station_id'] + ")"
+station_groups = station_df.groupby('state')['display_name'].apply(list).to_dict()
+station_map = dict(zip(station_df['display_name'], station_df['station_id']))
+
+# -- UI Elements --
+state_dropdown = widgets.Dropdown(options=sorted(station_groups.keys()), description="State")
+station_selector = widgets.SelectMultiple(description="Stations", layout=widgets.Layout(height='200px'))
+sig_checkbox = widgets.Checkbox(value=False, description="Average as SIG")
+index_dropdown = widgets.Dropdown(options=index_options, description="Index")
+export_btn = widgets.Button(description="Export CSV", button_style='success')
+output_csv_path = "nfdrs_output.csv"
+
+# -- Widget Logic --
+def update_station_list(change):
+    options = station_groups.get(change['new'], [])
+    station_selector.options = options
+    if options:
+        station_selector.value = [options[0]]
+
+state_dropdown.observe(update_station_list, names='value')
+update_station_list({'new': state_dropdown.value})
+
+# -- Data Fetcher --
+def get_df(url, component, station):
+    try:
+        r = requests.get(url)
+        if r.ok:
+            df = pd.read_csv(StringIO(r.text))
+            df.columns = [c.lower() for c in df.columns]
+            if 'observation_time' in df.columns and component in df.columns:
+                df['datetime'] = pd.to_datetime(df['observation_time'], errors='coerce')
+                df = df.dropna(subset=['datetime'])
+                df['station'] = station
+                return df[['datetime', component, 'station']]
+    except Exception as e:
+        print(f"Error fetching: {url}\n{e}")
+    return pd.DataFrame()
+
+# -- Plotter --
+def plot_chart(b):
+    component = index_dropdown.value
+    label = "SIG" if sig_checkbox.value else "Single"
+    selected = station_selector.value
+    all_data = []
+
+    for s in selected:
+        sid = station_map.get(s)
+        urls = [
+            (f"https://fems.fs2c.usda.gov/api/climatology/download-nfdr?stationIds={sid}&startDate={ranges['start_hist']}&endDate={ranges['end_hist']}&dataFormat=csv&dataset=all&fuelModels=Y", "hist"),
+            (f"https://fems.fs2c.usda.gov/api/climatology/download-nfdr?stationIds={sid}&startDate={ranges['start_current']}&endDate={ranges['end_current']}&dataFormat=csv&dataset=all&fuelModels=Y", "curr"),
+            (f"https://fems.fs2c.usda.gov/api/climatology/download-nfdr?stationIds={sid}&startDate={ranges['start_forecast']}&endDate={ranges['end_forecast']}&dataFormat=csv&dataset=forecast&fuelModels=Y", "fcst")
+        ]
+        for url, tag in urls:
+            df = get_df(url, component, s)
+            if not df.empty:
+                df['type'] = tag
+                all_data.append(df)
+
+    if not all_data:
+        print("No data available.")
+        return
+
+    df = pd.concat(all_data)
+    df.to_csv(output_csv_path, index=False)
+
+    fig = go.Figure()
+
+    if sig_checkbox.value:
+        df_grouped = df.groupby(['datetime', 'type'])[component].mean().reset_index()
+        for typ, style in zip(['hist', 'curr', 'fcst'], ['lines', 'lines', 'lines+markers']):
+            d = df_grouped[df_grouped['type'] == typ]
+            if not d.empty:
+                fig.add_trace(go.Scatter(x=d['datetime'], y=d[component], mode=style, name=f"{label} {typ.upper()}"))
+    else:
+        for station in df['station'].unique():
+            for typ, dash in zip(['hist', 'curr', 'fcst'], ['dot', 'solid', 'dash']):
+                d = df[(df['station'] == station) & (df['type'] == typ)]
+                if not d.empty:
+                    fig.add_trace(go.Scatter(x=d['datetime'], y=d[component], mode='lines', name=f"{station} {typ.upper()}", line=dict(dash=dash)))
+
+    fig.update_layout(title=f"NFDRS Chart: {component}", xaxis_title="Date", yaxis_title=component,
+                      hovermode="x unified", template="plotly_white")
+    tab_outputs[0].clear_output()
+    with tab_outputs[0]:
+        fig.show()
+
+    tab_outputs[1].clear_output()
+    with tab_outputs[1]:
+        display(df.head())
+
+    tab_outputs[2].clear_output()
+    with tab_outputs[2]:
+        display(FileLink(output_csv_path))
+
+# -- UI Layout --
+tab_outputs = [widgets.Output() for _ in range(3)]
+tabs = Tab(children=tab_outputs)
+tabs.set_title(0, "Chart")
+tabs.set_title(1, "Preview Data")
+tabs.set_title(2, "Download CSV")
+
+plot_button = widgets.Button(description="Generate Chart", button_style='primary')
+plot_button.on_click(plot_chart)
+
+ui = widgets.VBox([
+    widgets.HBox([state_dropdown, station_selector]),
+    widgets.HBox([index_dropdown, sig_checkbox]),
+    plot_button,
+    tabs
+])
+
+display(ui)
